@@ -1,6 +1,8 @@
 open Lwt.Infix
 
 open Acme_common
+module Jwk = Jose.Jwk
+module Jws = Jose.Jws
 
 let src = Logs.Src.create "letsencrypt" ~doc:"let's encrypt library"
 module Log = (val Logs.src_log src : Logs.LOG)
@@ -15,8 +17,10 @@ let location headers =
       Cohttp.Header.pp_hum headers
 
 let key_authorization key token =
-  let pk = Primitives.pub_of_priv key in
-  let thumbprint = Jwk.thumbprint (`Rsa pk) in
+  let jwk = Jwk.make_priv_rsa key  in
+  let thumbprint =
+    Jwk.get_thumbprint `SHA256 jwk |> Result.get_ok |> B64u.urlencode
+  in
   Printf.sprintf "%s.%s" token thumbprint
 
 type t = {
@@ -196,10 +200,30 @@ let get_nonce ?ctx url =
   | `OK, headers -> extract_nonce headers
   | s, _ -> error_in "get_nonce" s ""
 
+let encode_jws_acme ?kid_url ~data ~nonce url priv =
+  let priv_token = Jwk.make_priv_rsa priv in
+  let kid_or_jwk =
+    match kid_url with
+    | None ->
+        ( "jwk"
+        , Primitives.pub_of_priv priv |> Jwk.make_pub_rsa |> Jwk.to_pub_json)
+    | Some url -> "kid", `String (Uri.to_string url)
+  in
+  let url = "url", `String (Uri.to_string url) in
+  let header = `Assoc
+    [
+      "alg", `String "RS256"
+    ; kid_or_jwk
+    ; url
+    ; "nonce", `String nonce
+    ] |> Jose.Header.of_json |> Result.get_ok
+  in
+  Jws.sign ~header ~payload:data priv_token |> Result.get_ok |> Jws.to_string
+
 let rec http_post_jws ?ctx ?(no_key_url = false) cli data url =
   let prepare_post key nonce =
     let kid_url = if no_key_url then None else Some cli.account_url in
-    let body = Jws.encode_acme ?kid_url ~data:(json_to_string data) ~nonce url key in
+    let body = encode_jws_acme ?kid_url ~data:(json_to_string data) ~nonce url key in
     let body_len = string_of_int (String.length body) in
     let headers = Cohttp.Header.add headers  "Content-Length" body_len in
     let headers = Cohttp.Header.add headers "Content-Type" "application/jose+json" in

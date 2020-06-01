@@ -21,6 +21,7 @@ depends: [
   "zarith"
   "logs"
   "fmt"
+  "jose"
   "lwt" {>= "2.6.0"}
   "mirage-crypto"
   "mirage-crypto-pk"

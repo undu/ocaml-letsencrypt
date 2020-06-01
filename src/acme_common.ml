@@ -50,19 +50,6 @@ let opt_string_val key json =
   | `Null -> Ok None
   | _ -> err_msg "opt_string" key json
 
-let json_val member json =
-  match J.Util.member member json with
-  | `Assoc j -> Ok (`Assoc j)
-  | _ -> err_msg "json object" member json
-
-let b64_z_val member json =
-  string_val member json >>= fun s ->
-  Rresult.R.open_error_msg (B64u.urldecodez s)
-
-let b64_string_val member json =
-  string_val member json >>= fun s ->
-  Rresult.R.open_error_msg (B64u.urldecode s)
-
 let assoc_val key json =
   match J.Util.member key json with
   | `Assoc _ | `Null as x -> Ok x
@@ -101,104 +88,6 @@ let decode_ptime str =
 let maybe f = function
   | None -> Ok None
   | Some s -> f s >>| fun s' -> Some s'
-
-module Jwk = struct
-  type key = [ `Rsa of Mirage_crypto_pk.Rsa.pub ]
-
-  let encode = function
-    | `Rsa key ->
-      let e, n = Primitives.pub_to_z key in
-      `Assoc [
-        "e", `String (B64u.urlencodez e);
-        "kty", `String "RSA";
-        "n", `String (B64u.urlencodez n);
-      ]
-
-  let decode_json json =
-    string_val "kty" json >>= function
-    | "RSA" ->
-      b64_z_val "e" json >>= fun e ->
-      b64_z_val "n" json >>= fun n ->
-      Primitives.pub_of_z ~e ~n >>= fun pub ->
-      Ok (`Rsa pub)
-    | x -> Rresult.R.error_msgf "unknown key type %s" x
-
-  let decode data =
-    of_string data >>= fun json ->
-    decode_json json
-
-  let thumbprint pub_key =
-    let jwk = json_to_string (encode pub_key) in
-    let h = Primitives.sha256 jwk in
-    B64u.urlencode h
-end
-
-module Jws = struct
-  type header = {
-    alg : string;
-    nonce : string option;
-    jwk : Jwk.key option;
-  }
-
-  let encode ?(protected = []) ~data ~nonce priv =
-    let protected =
-      `Assoc (("alg", `String "RS256") :: protected @ [ "nonce", `String nonce ])
-      |> json_to_string
-    in
-    let protected = protected |> B64u.urlencode in
-    let payload = B64u.urlencode data in
-    let signature =
-      let m = protected ^ "." ^ payload in
-      Primitives.rs256_sign priv m |> B64u.urlencode
-    in
-    Printf.sprintf {|{"protected": "%s", "payload": "%s", "signature": "%s"}|}
-      protected payload signature
-
-  let encode_acme ?kid_url ~data ~nonce url priv =
-    let kid_or_jwk =
-      match kid_url with
-      | None -> "jwk", Jwk.encode (`Rsa (Primitives.pub_of_priv priv))
-      | Some url -> "kid", `String (Uri.to_string url)
-    in
-    let url = "url", `String (Uri.to_string url) in
-    let protected = [ kid_or_jwk ; url ] in
-    encode ~protected ~data ~nonce priv
-
-  let decode_header protected_header =
-    of_string protected_header >>= fun protected ->
-    (match json_val "jwk" protected with
-     | Ok key -> Jwk.decode_json key >>| fun k -> Some k
-     | Error _ -> Ok None) >>= fun jwk ->
-    string_val "alg" protected >>= fun alg ->
-    let nonce = match string_val "nonce" protected with
-      | Ok nonce -> Some nonce
-      | Error _ -> None
-    in
-    Ok { alg ; nonce ; jwk }
-
-  let decode ?pub data =
-    of_string data >>= fun jws ->
-    string_val "protected" jws >>= fun protected64 ->
-    string_val "payload" jws >>= fun payload64 ->
-    b64_string_val "signature" jws >>= fun signature ->
-    Rresult.R.open_error_msg (B64u.urldecode protected64) >>= fun protected ->
-    decode_header protected >>= fun header ->
-    Rresult.R.open_error_msg (B64u.urldecode payload64) >>= fun payload ->
-    (match pub, header.jwk with
-     | Some pub, _ -> Ok pub
-     | None, Some pub -> Ok pub
-     | None, None -> Error (`Msg "no public key found")) >>= fun pub ->
-    let verify m s =
-      match header.alg, pub with
-      | "RS256", `Rsa pub -> Primitives.rs256_verify pub m s
-      | _ -> false
-    in
-    let m = protected64 ^ "." ^ payload64 in
-    if verify m signature then
-      Ok (header, payload)
-    else
-      Rresult.R.error_msgf "signature verification failed"
-end
 
 let uri s = Ok (Uri.of_string s)
 
